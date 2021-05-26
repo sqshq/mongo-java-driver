@@ -16,6 +16,8 @@
 
 package com.mongodb.connection.netty;
 
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+
 import com.mongodb.MongoClientException;
 import com.mongodb.MongoException;
 import com.mongodb.MongoInternalException;
@@ -42,26 +44,26 @@ import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.socket.SocketChannel;
-import io.netty.handler.ssl.SslHandler;
+import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslContextBuilder;
+import io.netty.handler.ssl.SslProvider;
 import io.netty.handler.timeout.ReadTimeoutException;
 import io.netty.util.concurrent.EventExecutor;
-import org.bson.ByteBuf;
-
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.SSLEngine;
-import javax.net.ssl.SSLParameters;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.net.SocketAddress;
+import java.security.KeyStore;
+import java.security.KeyStoreException;
 import java.security.NoSuchAlgorithmException;
+import java.security.cert.CertificateException;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.CountDownLatch;
-
-import static com.mongodb.internal.connection.SslHelper.enableHostNameVerification;
-import static com.mongodb.internal.connection.SslHelper.enableSni;
-import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManagerFactory;
+import org.bson.ByteBuf;
 
 /**
  * A Stream implementation based on Netty 4.0.
@@ -133,17 +135,33 @@ final class NettyStream implements Stream {
 
             bootstrap.handler(new ChannelInitializer<SocketChannel>() {
                 @Override
-                public void initChannel(final SocketChannel ch) {
+                public void initChannel(final SocketChannel ch)
+                    throws KeyStoreException, IOException, NoSuchAlgorithmException, CertificateException {
                     if (sslSettings.isEnabled()) {
-                        SSLEngine engine = getSslContext().createSSLEngine(address.getHost(), address.getPort());
-                        engine.setUseClientMode(true);
-                        SSLParameters sslParameters = engine.getSSLParameters();
-                        enableSni(address.getHost(), sslParameters);
-                        if (!sslSettings.isInvalidHostNameAllowed()) {
-                            enableHostNameVerification(sslParameters);
+
+                        String trustStorePath = System.getProperty("javax.net.ssl.trustStore");
+                        String trustStorePassword = System.getProperty("javax.net.ssl.trustStorePassword");
+
+                        if (trustStorePath == null || trustStorePassword == null) {
+                          throw new IllegalArgumentException("javax.net.ssl.trustStore and trustStorePassword are required.");
                         }
-                        engine.setSSLParameters(sslParameters);
-                        ch.pipeline().addFirst("ssl", new SslHandler(engine, false));
+
+                        KeyStore trustStore = KeyStore.getInstance("PKCS12");
+
+                        try (FileInputStream inputStream = new FileInputStream(trustStorePath)) {
+                          trustStore.load(inputStream, trustStorePassword.toCharArray());
+                        }
+
+                        TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance("PKIX");
+                        trustManagerFactory.init(trustStore);
+
+                        SslContext sslContext =
+                            SslContextBuilder.forClient()
+                                .sslProvider(SslProvider.OPENSSL)
+                                .trustManager(trustManagerFactory)
+                                .build();
+
+                        ch.pipeline().addFirst("ssl", sslContext.newHandler(ch.alloc()));
                     }
                     int readTimeout = settings.getReadTimeout(MILLISECONDS);
                     if (readTimeout > 0) {
